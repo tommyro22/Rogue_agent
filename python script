@@ -1,12 +1,29 @@
 """
-Zuma Demo — Rogue Agent Simulator v9
-Saviynt Partner Soultion Architect · Tommy Roberts
+Zuma Demo — Rogue Agent Simulator v10
+Saviynt Channel Partner Enablement · Tommy Roberts
 
-Features:
-  - Exact JSON-RPC schemas for ITSM and CRM mock endpoints
-  - Direct individual tool invocation menu for testing specific endpoints
-  - Automated "Go Rogue" scenarios integrating all new API arguments
-  - CLI response printing to display in-memory mock database returns
+What it does:
+  - Registers a demo agent identity with the Zuma Agent Registry (menu 1)
+  - Opens an MCP session with the Access Gateway and fires tool calls at the
+    ITSM and CRM dummy servers (menu 2)
+  - Lets you call ALL 13 tools individually, run a one-shot "policy demo"
+    covering every tool, or run the automated rogue scenarios
+  - Survives sleeping back ends (free-tier hosting): timeouts are caught,
+    retried, and explained instead of crashing the script
+
+Run:
+  python zuma_rogue_agent_v2.py            # normal
+  python zuma_rogue_agent_v2.py --step     # presenter mode: pause before each call
+
+Optional environment variables (never hard-code credentials in this file):
+  ZUMA_GATEWAY_URL, ZUMA_GATEWAY_API_KEY, ZUMA_AGENT_SOURCE_ID
+  ZUMA_TENANT_DOMAIN, ZUMA_REGISTRY_TOKEN, ZUMA_OWNER_EMAIL, ZUMA_OWNER_NAME
+  ZUMA_TENANT_ID (optional X-Tenant-Id header for registration)
+  ZUMA_AGENT_NAME, ZUMA_AGENT_URL
+  ZUMA_COGNITO_DOMAIN, ZUMA_COGNITO_CLIENT_ID, ZUMA_COGNITO_CLIENT_SECRET, ZUMA_COGNITO_SCOPE
+  ZUMA_ITSM_PREFIX / ZUMA_CRM_PREFIX   (or --itsm-prefix / --crm-prefix)
+  ZUMA_TIMEOUT      seconds to wait for a tool call (default 60)
+  ZUMA_RETRY_WAIT   seconds between retries when a back end is asleep (default 15)
 """
 
 import argparse
@@ -15,17 +32,24 @@ import os
 import json
 import sys
 import random
+import socket
 import logging
 import getpass
-from datetime import datetime
+from dataclasses import dataclass
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Target Namespaces
+# Target namespaces
+# The gateway exposes each tool as <target name><separator><tool name>.
+# These must match the target names you gave the two servers on the gateway.
 # ─────────────────────────────────────────────────────────────────────────────
-ITSM_PREFIX = "ITSMMCPDummy__"
-CRM_PREFIX = "MockCRM__"
+ITSM_PREFIX = os.environ.get("ZUMA_ITSM_PREFIX", "ITSMMCPDummy__")
+CRM_PREFIX = os.environ.get("ZUMA_CRM_PREFIX", "MockCRM__")
+
+TOOL_TIMEOUT = float(os.environ.get("ZUMA_TIMEOUT", "60"))
+RETRY_WAIT = float(os.environ.get("ZUMA_RETRY_WAIT", "15"))
 
 # Valid mock database targets
 TICKET_IDS = ["TICK-101", "TICK-102"]
@@ -33,7 +57,7 @@ USER_IDS = ["usr_882", "usr_104"]
 CUSTOMER_IDS = ["CUST-104", "CUST-880"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANSI Formatting Helpers
+# ANSI formatting helpers
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     _COLOURS = sys.stdout.isatty() and os.name != "nt"
@@ -57,119 +81,365 @@ log = logging.getLogger("rogue-agent")
 
 _MCP_SESSION_ID = None
 _STEP_MODE = False
+_TOOL_SCHEMAS = {}   # tool name -> inputSchema, filled from tools/list
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool catalogue (all 13 tools)
+#
+# expected = what Zuma Evaluation Logs should show WITH THE DEMO POLICIES:
+#   ALLOW         tool is on the allow policy
+#   DENY-RULE     tool is named in the deny policy
+#   DENY-DEFAULT  tool is on neither list, so default deny applies
+#
+# guessed = argument names were not confirmed against the dummy server.
+#           If the gateway's tools/list returns a schema, arguments are built
+#           from it automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class Tool:
+    system: str          # "ITSM" or "CRM"
+    short: str           # tool name without prefix
+    tier: str            # LOW / MED / HIGH / CRIT
+    expected: str        # ALLOW / DENY-RULE / DENY-DEFAULT
+    args: dict
+    guessed: bool = False
+
+    @property
+    def full(self) -> str:
+        return (ITSM_PREFIX if self.system == "ITSM" else CRM_PREFIX) + self.short
+
+
+TOOLS = [
+    # ITSM
+    Tool("ITSM", "get_ticket_status",         "LOW",  "ALLOW",        {"ticket_id": "TICK-101"}),
+    Tool("ITSM", "search_tickets_by_customer", "LOW",  "ALLOW",        {"customer_id": "CUST-104"}),
+    Tool("ITSM", "create_support_ticket",     "MED",  "ALLOW",        {"user_id": "usr_882", "customer_id": "CUST-104", "issue": "Demo ticket from rogue agent", "priority": "Low"}, guessed=True),
+    Tool("ITSM", "check_user_permissions",    "MED",  "DENY-DEFAULT", {"user_id": "usr_882"}),
+    Tool("ITSM", "escalate_ticket_priority",  "MED",  "DENY-DEFAULT", {"ticket_id": "TICK-101", "new_priority": "Critical", "justification": "VIP Request"}),
+    Tool("ITSM", "force_password_reset",      "HIGH", "DENY-RULE",    {"user_id": "usr_882"}, guessed=True),
+    Tool("ITSM", "grant_admin_privilege",     "CRIT", "DENY-RULE",    {"user_id": "usr_882", "role": "SuperAdmin"}),
+    Tool("ITSM", "purge_audit_logs",          "CRIT", "DENY-RULE",    {"retention_days": 0}),
+    # CRM
+    Tool("CRM",  "list_customers",            "LOW",  "ALLOW",        {}),
+    Tool("CRM",  "get_customer_by_id",        "MED",  "DENY-DEFAULT", {"id": "CUST-104"}),
+    Tool("CRM",  "update_credit_limit",       "HIGH", "DENY-RULE",    {"id": "CUST-104", "newLimit": 250000, "reason": "Contract expansion"}),
+    Tool("CRM",  "export_customer_data",      "CRIT", "DENY-RULE",    {}),
+    Tool("CRM",  "delete_customer",           "CRIT", "DENY-RULE",    {"id": "CUST-880"}, guessed=True),
+]
+BY_SHORT = {t.short: t for t in TOOLS}
+
+EXPECTED_TEXT = {
+    "ALLOW":        "ALLOW         (on the allow list)",
+    "DENY-RULE":    "DENY          (named in the deny policy)",
+    "DENY-DEFAULT": "DENY          (default: on neither list)",
+}
+
+TIER_COLOUR = {"LOW": green, "MED": yellow, "HIGH": red, "CRIT": red}
+
+# Narrative lines used in step mode
+TALKING_POINTS = {
+    "get_ticket_status":          "Normal ITSM request. Individual calls are baseline activity.",
+    "search_tickets_by_customer": "Scoping target data across customer boundaries.",
+    "create_support_ticket":      "An ordinary write. Opening a ticket is a normal, reversible agent task.",
+    "check_user_permissions":     "Reconnaissance activity. Multi-user privilege queries trigger intent analysis.",
+    "escalate_ticket_priority":   "Modifying request scope before privilege escalation.",
+    "force_password_reset":       "Account takeover tool. Invalidates a user's password immediately.",
+    "grant_admin_privilege":      "Payload step. Attempting unauthorized global admin assignment.",
+    "purge_audit_logs":           "DESTRUCTIVE payload. Wiping compliance logs to hide evidence.",
+    "list_customers":             "Cross-domain pivot. Baseline ITSM agent jumping into the CRM catalog.",
+    "get_customer_by_id":         "Deeper CRM record enumeration. Returns sensitive profile data.",
+    "update_credit_limit":        "Malicious payload. Modifying sensitive financial limits.",
+    "export_customer_data":       "Exfiltration. Bulk export of customer PII and financial data.",
+    "delete_customer":            "Irreversible destruction of a customer record.",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mode 1: Agent Registration
 # ─────────────────────────────────────────────────────────────────────────────
 
+REGISTRATION_HINTS = {
+    400: "Validation failed. If you supplied an owner, every owner email must match an existing user in the tenant "
+         "(the response lists any that do not, and the agent is not created). Otherwise check the field named in the body.",
+    401: "Token rejected. This API expects a Cognito JWT Bearer token for the Developer (API User) persona. "
+         "A static API key or the gateway key will not work, and tokens expire.",
+    403: "The token is valid but is not allowed to register agents. Check the persona the token was issued for.",
+    404: "URL not found, or the tenant header does not match. Check the tenant domain (no https://, no path) and any Tenant ID you sent.",
+    409: "An agent with this name probably already exists. Choose a different agent name.",
+    422: "A field was rejected. Check the environment value (dev, test, staging, prod) and the owner details.",
+}
+
+# Set after a successful registration so step 2 can offer it as the default ID
+_REGISTERED_AGENT_ID = None
+
+
+def _looks_like_jwt(token: str) -> bool:
+    return token.count(".") == 2 and len(token) > 60
+
+
+def fetch_cognito_token(domain: str, client_id: str, client_secret: str, scope: str = ""):
+    """OAuth2 client-credentials request to a Cognito token endpoint. Returns the token string or None.
+    The secret and the token are never printed."""
+    domain = domain.strip()
+    local = domain.replace("https://", "").replace("http://", "").startswith(("localhost", "127.0.0.1"))
+    if not domain.startswith(("http://", "https://")):
+        domain = ("http://" if local else "https://") + domain
+    if "/oauth2/token" not in domain:
+        domain = domain.rstrip("/") + "/oauth2/token"
+
+    form = {"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret}
+    if scope:
+        form["scope"] = scope
+    req = urllib.request.Request(
+        domain, data=urllib.parse.urlencode(form).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
+
+    log.info(f"Requesting token from {domain.split('?')[0]} ...")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        log.error(red(f"Token request failed: HTTP {e.code} {e.reason}"))
+        if body:
+            print(f"  Response body: {body[:500]}")
+        if e.code in (400, 401):
+            print(yellow("  Hint: check the client ID and secret, that the app client allows the client-credentials flow,\n"
+                         "  and whether a scope is required (invalid_client / invalid_scope in the body will say which)."))
+        return None
+    except (TimeoutError, socket.timeout):
+        log.error(red("Token request timed out."))
+        return None
+    except urllib.error.URLError as e:
+        log.error(red(f"Network error reaching the token endpoint: {e.reason}"))
+        print(yellow("  Hint: check the Cognito domain (for example https://<prefix>.auth.<region>.amazoncognito.com)."))
+        return None
+    except (json.JSONDecodeError, OSError) as e:
+        log.error(red(f"Unexpected token response: {e}"))
+        return None
+
+    token = data.get("access_token")
+    if not token:
+        log.error(red("The response did not contain an access_token."))
+        return None
+    log.info(green(f"✓ Token obtained ({len(token)} characters, expires in {data.get('expires_in', '?')}s). It is held in memory only."))
+    return token
+
+
+def _build_registration_request(tenant_domain, token, tenant_id, agent_name, source_id,
+                                owner_email, owner_name, agent_url):
+    """Documented v2 registration request: POST /agent/v2/registry/agents."""
+    scheme = "http" if tenant_domain.startswith(("localhost", "127.0.0.1")) else "https"
+    url = f"{scheme}://{tenant_domain}/agent/v2/registry/agents"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "ZumaRogueDemoAgent/10.0",
+    }
+    if tenant_id:
+        headers["X-Tenant-Id"] = str(tenant_id)   # documented for tenant-scoped registry calls; omit if not needed
+
+    payload = {
+        "name": agent_name,
+        "displayName": "Python Rogue Agent Demo",
+        "description": "Python Rogue Agent Simulator for Saviynt Enablement.",
+        "url": agent_url,
+        "environment": "dev",
+        "agentType": "autonomous",
+        "platform": "python",
+        "framework": "custom",
+        "version": "10.0.0",
+        "criticality": "high",
+        "agentMetadata": {
+            "sourceId": source_id,
+            "execution_runtime": f"python{sys.version_info.major}.{sys.version_info.minor}",
+            "script_path": os.path.basename(sys.argv[0]) or "zuma_rogue_agent_v2.py",
+        },
+        "labels": {"team": "partner-enablement", "data_sensitivity": "internal"},
+    }
+    if owner_email:   # owners are optional; every email must match an existing tenant user
+        payload["owners"] = [{
+            "name": owner_name, "email": owner_email, "role": "Technical Owner",
+            "rank": 1, "source": "Manual",
+        }]
+    return url, headers, payload
+
+
 def run_agent_registration():
-    print("\n" + "="*62)
+    global _REGISTERED_AGENT_ID
+    print("\n" + "=" * 62)
     print(bold(" AGENT REGISTRATION MODE — Setup Parameters"))
-    print("="*62)
+    print("=" * 62)
+    print(dim("  Uses the documented API: POST /agent/v2/registry/agents\n"))
 
     domain_def = os.environ.get("ZUMA_TENANT_DOMAIN", "beta.use1.zuma.saviyntcloud.com")
     tenant_domain = input(f" Enter Zuma Tenant Domain [{domain_def}]: ").strip() or domain_def
-    tenant_domain = tenant_domain.replace("https://", "").rstrip("/")
+    tenant_domain = tenant_domain.replace("https://", "").replace("http://", "").split("/")[0]
 
-    tenant_id_def = os.environ.get("ZUMA_TENANT_ID", "1")
-    tenant_id = input(f" Enter Tenant ID [{tenant_id_def}]: ").strip() or tenant_id_def
+    tid_def = os.environ.get("ZUMA_TENANT_ID", "")
+    raw_tid = input(f" Enter Tenant ID for the X-Tenant-Id header (blank to omit){f' [{tid_def}]' if tid_def else ''}: ").strip() or tid_def
+    tenant_id = raw_tid.rstrip("/").split("/")[-1]      # tolerate a pasted URL
 
     token_def = os.environ.get("ZUMA_REGISTRY_TOKEN", "")
-    if token_def:
-        registry_token = getpass.getpass(" Enter Registry Admin Token [hidden, press Enter for env default]: ").strip() or token_def
+    cog_domain_def = os.environ.get("ZUMA_COGNITO_DOMAIN", "")
+    print(" How do you want to authenticate?")
+    print("  1) Paste a Bearer token (Cognito JWT) I already have")
+    print("  2) Fetch one from Cognito using a client ID and secret")
+    auth_def = "2" if (cog_domain_def and not token_def) else "1"
+    auth_choice = input(f" Select [1-2] [{auth_def}]: ").strip() or auth_def
+
+    registry_token = ""
+    if auth_choice == "2":
+        cog_domain = input(f" Enter Cognito domain or token URL{f' [{cog_domain_def}]' if cog_domain_def else ''}: ").strip() or cog_domain_def
+        cid_def = os.environ.get("ZUMA_COGNITO_CLIENT_ID", "")
+        client_id = input(f" Enter Cognito Client ID{f' [{cid_def}]' if cid_def else ''}: ").strip() or cid_def
+        sec_def = os.environ.get("ZUMA_COGNITO_CLIENT_SECRET", "")
+        client_secret = getpass.getpass(" Enter Cognito Client Secret [hidden" + (", press Enter for env default" if sec_def else "") + "]: ").strip() or sec_def
+        scope_def = os.environ.get("ZUMA_COGNITO_SCOPE", "")
+        scope = input(f" Enter scope, if your tenant requires one{f' [{scope_def}]' if scope_def else ' (usually blank)'}: ").strip() or scope_def
+        if not (cog_domain and client_id and client_secret):
+            print(red("\n Error: Cognito domain, client ID and client secret are all required.\n"))
+            return
+        registry_token = fetch_cognito_token(cog_domain, client_id, client_secret, scope) or ""
+        if not registry_token:
+            return
     else:
-        registry_token = getpass.getpass(" Enter Registry Admin Token [hidden]: ").strip()
+        prompt = " Enter Bearer token for the Developer (API User) persona"
+        if token_def:
+            registry_token = getpass.getpass(prompt + " [hidden, press Enter for env default]: ").strip() or token_def
+        else:
+            registry_token = getpass.getpass(prompt + " [hidden]: ").strip()
 
-    email_def = os.environ.get("ZUMA_OWNER_EMAIL", "admin@company.com")
-    owner_email = input(f" Enter Owner Email [{email_def}]: ").strip() or email_def
+    if registry_token and not _looks_like_jwt(registry_token):
+        print(yellow(f"\n  Warning: this token ({len(registry_token)} characters) does not look like a JWT "
+                     "(expected three dot-separated parts).\n  A static API key will not be accepted by the registry. Continuing anyway.\n"))
 
-    source_id_def = f"python-agent-{random.randint(1000, 9999)}"
+    email_def = os.environ.get("ZUMA_OWNER_EMAIL", "")
+    owner_email = input(f" Enter Owner Email, an EXISTING tenant user (blank = no owner){f' [{email_def}]' if email_def else ''}: ").strip() or email_def
+    owner_name = ""
+    if owner_email:
+        name_def = os.environ.get("ZUMA_OWNER_NAME", owner_email.split("@")[0].replace(".", " ").title())
+        owner_name = input(f" Enter Owner Display Name [{name_def}]: ").strip() or name_def
+
+    agent_name_def = os.environ.get("ZUMA_AGENT_NAME", "python-rogue-agent")
+    agent_name = input(f" Enter Agent Name [{agent_name_def}]: ").strip() or agent_name_def
+
+    source_id_def = os.environ.get("ZUMA_AGENT_SOURCE_ID", "python-script-001")
     source_id = input(f" Enter Agent Source ID [{source_id_def}]: ").strip() or source_id_def
 
+    url_def = os.environ.get("ZUMA_AGENT_URL", "https://example.com/zuma-rogue-agent-demo")
+    agent_url = input(f" Enter Agent URL (endpoint or repo) [{url_def}]: ").strip() or url_def
+
     if not registry_token:
-        print(red("\n Error: Registry Token is required for registration.\n"))
+        print(red("\n Error: a Bearer token is required for registration.\n"))
+        return
+    if owner_email and "@" not in owner_email:
+        print(red("\n Error: that owner email does not look valid.\n"))
+        return
+    if not owner_email:
+        print(yellow("  Note: no owner supplied. The agent will show 'No Owner', and a gateway policy such as\n"
+                     "  'Block agents without owner' would deny it if enabled.\n"))
+
+    url, headers, payload = _build_registration_request(
+        tenant_domain, registry_token, tenant_id, agent_name, source_id, owner_email, owner_name, agent_url)
+
+    # Preview before sending (the token is never printed)
+    print("\n" + "─" * 62)
+    print(bold(" Preview — about to send:"))
+    print(f"  POST   {url}")
+    print(f"  Tenant ID header : {tenant_id or '(none)'}")
+    print(f"  Token            : {'*' * 8} ({len(registry_token)} characters)")
+    print(f"  Agent            : {agent_name}   (source ID {source_id})")
+    print(f"  Owner            : {f'{owner_name} <{owner_email}>' if owner_email else '(none)'}")
+    print("─" * 62)
+    try:
+        go = input(" Press Enter to send, or q to cancel: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+    if go == "q":
+        print(dim("  Cancelled.\n"))
         return
 
-    url = f"https://{tenant_domain}/agent/v3/registry/agents"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {registry_token}",
-        "X-Saviynt-API-Key": registry_token,
-        "X-Tenant-Id": str(tenant_id),
-        "User-Agent": "ZumaRogueDemoAgent/9.0"
-    }
-
-    payload = {
-        "schema_version": "1.0",
-        "identity": {
-            "name": "python-rogue-agent",
-            "displayName": "Python Rogue Agent Demo",
-            "sourceId": source_id,
-            "platform": "Python",
-            "framework": "CustomScript",
-            "version": "9.0.0",
-            "agentType": "script",
-            "ingestionMethod": "API",
-            "environment": "dev"
-        },
-        "user": {
-            "description": "Python Rogue Agent Simulator for Saviynt Enablement.",
-            "businessFunction": "Security Testing"
-        },
-        "governance_hints": {
-            "suggested_criticality": "high",
-            "data_sensitivity": ["internal"],
-            "compliance_scope": ["none"],
-            "expected_usage": "Rogue behavior testing"
-        },
-        "owners": [
-            {
-                "email": owner_email,
-                "role": "it",
-                "type": "User",
-                "rank": 1
-            }
-        ]
-    }
-
-    print("\n" + "─"*62)
-    log.info("Submitting Agent Builder Manifest to Zuma Registry API...")
+    log.info("Submitting agent registration to the Zuma Agent Registry API...")
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp_bytes = resp.read().decode("utf-8")
-            
-            print("\n" + "="*62)
-            print(green(bold(" ✓ REGISTRATION SUCCESSFUL!")))
-            print("="*62)
-            print(f" Registered Agent Name : {bold('python-rogue-agent')}")
-            print(f" Registered Source ID  : {cyan(source_id)}")
-            print(f" Owner Email           : {owner_email}")
-            print("─"*62)
-            print(yellow(bold("\n ACTION REQUIRED IN ZUMA UI:")))
-            print(" Please log in to your Zuma Tenant and verify:")
-            print(f"  1. Go to {bold('Inventory > AI Agent')} tab.")
-            print(f"  2. Confirm agent with Source ID '{cyan(source_id)}' appears as Active.")
-            print(f"  3. Note this Source ID for Runtime Gateway Tool Invocation.\n")
-            
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_text = resp.read().decode("utf-8", errors="replace")
+            status = resp.status
+
+        data = {}
+        try:
+            data = json.loads(resp_text) if resp_text.strip() else {}
+        except json.JSONDecodeError:
+            pass
+        agent_id = data.get("agentId") if isinstance(data, dict) else None
+        reg_status = data.get("status") if isinstance(data, dict) else None
+        if agent_id:
+            _REGISTERED_AGENT_ID = str(agent_id)
+
+        print("\n" + "=" * 62)
+        print(green(bold(f" ✓ REGISTRATION SUCCESSFUL!  (HTTP {status})")))
+        print("=" * 62)
+        print(f" Agent Name  : {bold(agent_name)}")
+        print(f" Agent ID    : {cyan(str(agent_id)) if agent_id else dim('(not returned)')}")
+        print(f" Status      : {reg_status or dim('(not returned)')}")
+        print(f" Owner       : {owner_email or '(none)'}")
+        if not agent_id and resp_text.strip():
+            print(f" Server response: {dim(resp_text.strip()[:500])}")
+        print("─" * 62)
+        print(yellow(bold("\n NEXT STEPS:")))
+        print(f"  1. In Zuma open {bold('Governance > Agents')}, find '{agent_name}', and check Overview for Agent ID and Status.")
+        print("  2. New agents are created as 'pending'. On the gateway, check that 'Block agents by status'")
+        print("     does NOT include Pending, otherwise this agent's calls will be blocked.")
+        if agent_id:
+            print("  3. In step 2 (Invoke Tools) the gateway must resolve your identity against the registry. Try, in order:")
+            print(f"       {cyan('agent-registry:' + str(agent_id))}   (documented format for API-registered agents)")
+            print(f"       {cyan(str(agent_id))}")
+            print("     Then check the 'Agent Source ID' / Agent ID shown for your calls in Zuma to see which one matched.\n")
+        else:
+            print("  3. Use the matching source ID in step 2 (Invoke Tools).\n")
+
     except urllib.error.HTTPError as e:
         try:
-            err_body = e.read().decode("utf-8")
+            err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
-            err_body = f"HTTP {e.code}: {e.reason}"
-        log.error(red(f"Registration Failed! Response: {err_body}"))
+            err_body = ""
+        log.error(red(f"Registration Failed!  HTTP {e.code} {e.reason}"))
+        if err_body:
+            print(f"  Response body: {err_body[:1000]}")
+        hint = REGISTRATION_HINTS.get(e.code)
+        if hint is None and 500 <= e.code < 600:
+            hint = "Server-side error. Try again shortly; if it persists, contact your Saviynt representative."
+        if hint:
+            print(yellow(f"  Hint: {hint}"))
+        print(dim(f"  URL called: {url}\n"))
+    except (TimeoutError, socket.timeout):
+        log.error(red("Registration timed out. The tenant did not respond within 30s."))
     except urllib.error.URLError as e:
         log.error(red(f"Network error: {e.reason}"))
+        print(yellow("  Hint: check the tenant domain and your internet connection.\n"))
+    except OSError as e:
+        log.error(red(f"Connection problem: {e}"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mode 2: Tool Invocation & Gateway Execution
+# Mode 2: MCP transport (gateway)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def send_mcp_request(gateway_url: str, api_key: str, method: str, params: dict) -> dict:
+RETRYABLE_HTTP = {502, 503, 504, 522, 524}
+
+
+def send_mcp_request(gateway_url: str, api_key: str, method: str, params: dict, timeout: float = 30) -> dict:
+    """POST one JSON-RPC request. Never raises on network trouble; returns {"error": {...}}."""
     global _MCP_SESSION_ID
 
     payload = {
@@ -186,7 +456,7 @@ def send_mcp_request(gateway_url: str, api_key: str, method: str, params: dict) 
         "X-Saviynt-API-Key": api_key,
         "X-Zuma-API-Key": api_key,
         "Zuma-API-Key": api_key,
-        "User-Agent": "ZumaRogueDemoAgent/9.0",
+        "User-Agent": "ZumaRogueDemoAgent/10.0",
     }
 
     if _MCP_SESSION_ID:
@@ -196,15 +466,13 @@ def send_mcp_request(gateway_url: str, api_key: str, method: str, params: dict) 
     req = urllib.request.Request(gateway_url, data=body, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             returned_session = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
             if returned_session:
                 _MCP_SESSION_ID = returned_session
 
             raw = resp.read().decode("utf-8")
 
-            # Strip surrounding whitespace — guards against newline-only bodies
-            # that are truthy but not parseable JSON.
             response_bytes = raw.strip()
             if not response_bytes:
                 return {}
@@ -212,8 +480,6 @@ def send_mcp_request(gateway_url: str, api_key: str, method: str, params: dict) 
             # The Zuma gateway returns SSE-format events, e.g.:
             #   event: message
             #   data: {"jsonrpc":"2.0", ...}
-            # The response may start with "event:" rather than "data:", so check
-            # whether ANY line is a data-line rather than just the first.
             lines = response_bytes.splitlines()
             if any(line.startswith("data:") for line in lines):
                 data_lines = [
@@ -227,19 +493,60 @@ def send_mcp_request(gateway_url: str, api_key: str, method: str, params: dict) 
             try:
                 return json.loads(response_bytes)
             except json.JSONDecodeError as exc:
-                log.warning(
-                    f"Gateway returned non-JSON body (first 200 chars): "
-                    f"{response_bytes[:200]!r} — {exc}"
-                )
+                log.warning(f"Gateway returned non-JSON body (first 200 chars): {response_bytes[:200]!r} — {exc}")
                 return {"error": {"code": -32700, "message": f"Non-JSON gateway response: {response_bytes[:200]}"}}
+
     except urllib.error.HTTPError as e:
         try:
             err_body = e.read().decode("utf-8")
         except Exception:
             err_body = f"HTTP {e.code}: {e.reason}"
         return {"error": {"code": e.code, "message": err_body}}
+    except (TimeoutError, socket.timeout):
+        return {"error": {"code": "timeout", "message": f"No response within {timeout:.0f}s", "retryable": True}}
     except urllib.error.URLError as e:
+        if isinstance(e.reason, (TimeoutError, socket.timeout)):
+            return {"error": {"code": "timeout", "message": f"No response within {timeout:.0f}s", "retryable": True}}
         return {"error": {"code": 0, "message": str(e.reason)}}
+    except OSError as e:
+        return {"error": {"code": 0, "message": f"Connection problem: {e}"}}
+
+
+def _retryable(resp: dict) -> bool:
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if not err:
+        return False
+    return bool(err.get("retryable")) or err.get("code") in RETRYABLE_HTTP
+
+
+def call_tool(gateway_url: str, api_key: str, name: str, args: dict, *,
+              retries: int = 2, wait: float = None, timeout: float = None) -> dict:
+    """tools/call with retry when the back end looks asleep (timeouts / 502-504).
+
+    Note: if a timeout happened AFTER the server acted, a retry repeats the call.
+    That is acceptable for dummy servers and simply adds a log line in Zuma.
+    """
+    wait = RETRY_WAIT if wait is None else wait
+    timeout = TOOL_TIMEOUT if timeout is None else timeout
+    attempt = 0
+    while True:
+        res = send_mcp_request(gateway_url, api_key, "tools/call",
+                               {"name": name, "arguments": args}, timeout=timeout)
+        if not _retryable(res) or attempt >= retries:
+            break
+        attempt += 1
+        log.warning(yellow(
+            f"  ⏳ No response — the back end may be asleep (free-tier hosting). "
+            f"Retry {attempt}/{retries} in {wait:.0f}s..."))
+        time.sleep(wait)
+
+    if _retryable(res):
+        res["error"]["message"] = (
+            f"The back end did not respond after {retries + 1} attempts. "
+            "If the ITSM dummy is on a free tier, open its URL in a browser, wait for it to load, "
+            "then try again (the 'Wake up backends' menu option also does this)."
+        )
+    return res
 
 
 def initialize_gateway_session(gateway_url: str, api_key: str, agent_source_id: str) -> bool:
@@ -249,53 +556,104 @@ def initialize_gateway_session(gateway_url: str, api_key: str, agent_source_id: 
         "capabilities": {},
         "clientInfo": {
             "name": "python-rogue-agent",
-            "version": "9.0.0",
+            "version": "10.0.0",
             "x-agent-source-id": agent_source_id,
-            "cdsBotId": agent_source_id
-        }
+            "cdsBotId": agent_source_id,
+        },
     }
-    resp = send_mcp_request(gateway_url, api_key, "initialize", params)
+    resp = send_mcp_request(gateway_url, api_key, "initialize", params, timeout=30)
 
     if "error" in resp:
         log.error(red(f"MCP Initialization Failed! Gateway message: {resp['error']}"))
+        if resp["error"].get("code") in (401, 403):
+            print(yellow("  Hint: check the gateway URL and the gateway API key (not the registry token).\n"))
         return False
 
     log.info(green(f"✓ MCP Session Initialized! (Session ID: {_MCP_SESSION_ID or 'Established'})"))
     return True
 
 
+def load_tool_schemas(gateway_url: str, api_key: str) -> list:
+    """Fetch tools/list, cache each tool's input schema. Returns the tool list ([] on failure)."""
+    resp = send_mcp_request(gateway_url, api_key, "tools/list", {}, timeout=30)
+    if "error" in resp:
+        return []
+    tools = resp.get("result", {}).get("tools", []) or []
+    for t in tools:
+        if t.get("name"):
+            _TOOL_SCHEMAS[t["name"]] = t.get("inputSchema") or {}
+    return tools
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Execution Routines & Scenarios
+# Argument handling
 # ─────────────────────────────────────────────────────────────────────────────
 
-TALKING_POINTS = {
-    f"{ITSM_PREFIX}get_ticket_status": "Normal ITSM request. Individual calls are baseline activity.",
-    f"{ITSM_PREFIX}check_user_permissions": "Reconnaissance activity. Multi-user privilege queries trigger intent analysis.",
-    f"{ITSM_PREFIX}search_tickets_by_customer": "Scoping target data across customer boundaries.",
-    f"{ITSM_PREFIX}escalate_ticket_priority": "Modifying request scope before privilege escalation.",
-    f"{ITSM_PREFIX}grant_admin_privilege": "Payload step. Attempting unauthorized global admin assignment.",
-    f"{ITSM_PREFIX}purge_audit_logs": "DESTRUCTIVE Payload. Wiping compliance logs.",
-    f"{CRM_PREFIX}list_customers": "Cross-domain pivot. Baseline ITSM agent jumping into CRM catalog.",
-    f"{CRM_PREFIX}get_customer_by_id": "Deeper CRM record enumeration.",
-    f"{CRM_PREFIX}update_credit_limit": "Malicious payload. Modifying sensitive financial limits.",
-    f"{CRM_PREFIX}export_customer_data": "Exfiltration phase of behavior drift sequence.",
+SAMPLE_VALUES = {
+    "ticket_id": "TICK-101", "user_id": "usr_882", "customer_id": "CUST-104",
+    "id": "CUST-104", "issue": "Demo ticket from rogue agent", "priority": "Low",
+    "reason": "Demo", "justification": "Demo", "role": "SuperAdmin",
 }
 
-def step_prompt(phase: str, tool_name: str, arguments: dict) -> bool:
+def _schema_for(tool: Tool):
+    if tool.full in _TOOL_SCHEMAS:
+        return _TOOL_SCHEMAS[tool.full]
+    for name, schema in _TOOL_SCHEMAS.items():
+        if name.endswith(tool.short):
+            return schema
+    return None
+
+def resolve_args(tool: Tool, override: dict = None) -> dict:
+    """Arguments for a tool. Explicit override wins. For tools whose argument names
+    were guessed, build them from the server's own schema when we have it."""
+    if override is not None:
+        return override
+    if not tool.guessed:
+        return tool.args
+    schema = _schema_for(tool)
+    props = (schema or {}).get("properties") or {}
+    if not props:
+        return tool.args
+    out = {}
+    for name in (schema.get("required") or []):
+        spec = props.get(name, {})
+        if name in SAMPLE_VALUES:
+            out[name] = SAMPLE_VALUES[name]
+        elif spec.get("enum"):
+            out[name] = spec["enum"][0]
+        elif spec.get("type") in ("integer", "number"):
+            out[name] = 1
+        elif spec.get("type") == "boolean":
+            out[name] = True
+        else:
+            out[name] = "demo"
+    for k, v in tool.args.items():          # prefer our sample values where the names exist
+        if k in props:
+            out[k] = v
+    return out or tool.args
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Presenter helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def step_prompt(phase: str, tool: Tool, arguments: dict) -> bool:
     if not _STEP_MODE:
         return True
 
     print()
     print(cyan(f"  ┌─ {phase}"))
-    print(cyan("  │  Tool:") + f"  {bold(tool_name)}")
+    print(cyan("  │  Tool:") + f"  {bold(tool.full)}")
     print(cyan("  │  Args:") + f"  {dim(json.dumps(arguments))}")
     print(cyan("  │"))
-    print(cyan("  │  ") + yellow("Talking point: ") + TALKING_POINTS.get(tool_name, "Monitored tool call."))
+    print(cyan("  │  ") + yellow("Talking point: ") + TALKING_POINTS.get(tool.short, "Monitored tool call."))
+    print(cyan("  │  ") + yellow("With the demo policies, Zuma should log: ") + EXPECTED_TEXT[tool.expected])
     print(cyan("  └─ ") + dim("Enter=fire  s=skip  q=quit  "), end="", flush=True)
 
     try:
         choice = input().strip().lower()
     except (KeyboardInterrupt, EOFError):
+        print()
         sys.exit(0)
 
     if choice == "q":
@@ -305,110 +663,257 @@ def step_prompt(phase: str, tool_name: str, arguments: dict) -> bool:
         return False
     return True
 
-def fire(gateway_url: str, api_key: str, phase: str, tool_name: str, arguments: dict, *, quiet: bool = False) -> dict:
-    if not step_prompt(phase, tool_name, arguments):
-        return {}
+
+def _result_ok(res: dict) -> bool:
+    if not isinstance(res, dict) or "error" in res:
+        return False
+    return not res.get("result", {}).get("isError", False)
+
+
+def fire(gateway_url: str, api_key: str, phase: str, short: str, args: dict = None, *, quiet: bool = False):
+    """Fire one tool call (scenario use). Returns the response dict, or None if skipped in step mode."""
+    tool = BY_SHORT[short]
+    arguments = resolve_args(tool, args)
+
+    if not step_prompt(phase, tool, arguments):
+        return None
 
     if not quiet:
-        log.info(f"→ {bold(tool_name)}  {dim(json.dumps(arguments))}")
+        log.info(f"→ {bold(tool.full)}  {dim(json.dumps(arguments))}")
 
-    result = send_mcp_request(gateway_url, api_key, "tools/call", {"name": tool_name, "arguments": arguments})
+    result = call_tool(gateway_url, api_key, tool.full, arguments)
 
     if "error" in result:
         log.warning(f"  ← {red('ERROR')}  {result['error']}")
-    else:
-        if not quiet:
-            inner_result = result.get('result', {})
-            log.info(f"  ← {green('OK')}  Response: {dim(json.dumps(inner_result))}")
+    elif not _result_ok(result):
+        log.warning(f"  ← {red('TOOL ERROR')}  {json.dumps(result.get('result', {}))[:300]}")
+    elif not quiet:
+        log.info(f"  ← {green('OK')}  Response: {dim(json.dumps(result.get('result', {}))[:240])}")
     return result
 
-def run_single_tool(gw_url: str, api_key: str, tool_name: str, args: dict):
-    print("\n" + "─"*62)
-    log.info(f"Invoking Tool: {bold(tool_name)}")
-    log.info(f"Arguments: {args}")
 
-    res = send_mcp_request(gw_url, api_key, "tools/call", {"name": tool_name, "arguments": args})
+def run_single_tool(gw_url: str, api_key: str, tool: Tool):
+    arguments = resolve_args(tool)
+
+    if not step_prompt("Single tool call", tool, arguments):
+        return
+
+    print("\n" + "─" * 62)
+    log.info(f"Invoking Tool: {bold(tool.full)}")
+    log.info(f"Arguments: {arguments}")
+
+    res = call_tool(gw_url, api_key, tool.full, arguments)
 
     if "error" in res:
         log.warning(f"  ← {red('ERROR')}  {res['error']}")
+    elif not _result_ok(res):
+        log.warning(f"  ← {red('TOOL ERROR')}")
     else:
         log.info(f"  ← {green('OK')}")
 
     print(cyan("\n  Gateway Response:"))
     print("  " + "\n  ".join(json.dumps(res, indent=2).splitlines()))
-    print("─"*62 + "\n")
+    print(dim(f"\n  With the demo policies, Zuma Evaluation Logs should show: {EXPECTED_TEXT[tool.expected]}"))
+    print("─" * 62 + "\n")
+
 
 def pause(seconds: float):
     if not _STEP_MODE:
         time.sleep(seconds)
 
 def _header(title: str, subtitle: str, capability: str):
-    print(f"\n  {bold(title)}\n  {dim(subtitle)}\n  Capability: {cyan(capability)}\n  " + "─"*62)
+    print(f"\n  {bold(title)}\n  {dim(subtitle)}\n  Capability: {cyan(capability)}\n  " + "─" * 62)
 
 def _footer(msg: str):
     print(f"\n  {green('✓')}  {msg}\n  {dim(f'Session ID: {_MCP_SESSION_ID}')}\n")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilities: connection test and back-end wake-up
+# ─────────────────────────────────────────────────────────────────────────────
+
 def option_test_tools(gateway_url: str, api_key: str):
-    print("\n" + "="*62)
+    print("\n" + "=" * 62)
     print(bold(" Connection Test: Fetching Tool Catalog ('tools/list')"))
-    print("="*62)
-    
-    tools_resp = send_mcp_request(gateway_url, api_key, "tools/list", {})
-    if "error" in tools_resp:
-        log.error(red(f"Tools list failed: {tools_resp['error']}"))
+    print("=" * 62)
+
+    tools = load_tool_schemas(gateway_url, api_key)
+    if not tools:
+        log.error(red("Tools list failed or returned no tools. Check the gateway URL, key and targets."))
         return False
 
-    tools = tools_resp.get("result", {}).get("tools", [])
     log.info(green(f"✓ Success! Gateway exposed {len(tools)} downstream tools."))
-    if tools:
-        print("\n  Available tools:")
-        for t in tools:
-            print(f"   - {t.get('name')}")
+    print("\n  Available tools (required parameters in brackets):")
+    for t in tools:
+        req = (t.get("inputSchema") or {}).get("required") or []
+        print(f"   - {t.get('name')}  {dim('[' + ', '.join(req) + ']') if req else ''}")
+
+    exposed = {t.get("name") for t in tools}
+    missing = [x.full for x in TOOLS if x.full not in exposed]
+    if missing:
+        print(yellow(f"\n  Note: {len(missing)} of the 13 expected tool names were not found exactly as the script builds them:"))
+        for m in missing:
+            print(yellow(f"   - {m}"))
+        print(yellow("  If the gateway shows a different prefix, restart with --itsm-prefix / --crm-prefix."))
     print()
     return True
+
+
+def wake_backends(gateway_url: str, api_key: str):
+    """One harmless read per back end, with a long timeout, to wake free-tier hosting."""
+    print("\n" + "=" * 62)
+    print(bold(" Waking up back ends (free-tier hosting can take 30-60s)"))
+    print("=" * 62)
+    print(dim("  This makes two harmless read calls, so you will see two entries in the Zuma logs.\n"))
+
+    all_ok = True
+    for tool in (BY_SHORT["get_ticket_status"], BY_SHORT["list_customers"]):
+        label = "ITSM" if tool.system == "ITSM" else "CRM "
+        start = time.time()
+        log.info(f"  {label}  calling {tool.short} ...")
+        res = call_tool(gateway_url, api_key, tool.full, resolve_args(tool),
+                        retries=3, wait=10, timeout=90)
+        took = time.time() - start
+        if _result_ok(res):
+            log.info(f"  {label}  {green('awake')}  ({took:.0f}s)")
+        else:
+            all_ok = False
+            log.warning(f"  {label}  {red('not responding')}  ({took:.0f}s)  {res.get('error', '')}")
+    print()
+    if all_ok:
+        print(green("  ✓ Both back ends are responding.\n"))
+    else:
+        print(yellow("  One or more back ends did not respond. Open their URLs in a browser, wait, and run this again.\n"))
+    return all_ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Policy demo: all 13 tools, grouped by expected outcome
+# ─────────────────────────────────────────────────────────────────────────────
+
+POLICY_GROUPS = [
+    ("ALLOW",        "Group 1 — Safe tools",       "On the allow list. Zuma should log ALLOW."),
+    ("DENY-DEFAULT", "Group 2 — Unlisted tools",   "On NO list. Default deny applies, so Zuma should log DENY."),
+    ("DENY-RULE",    "Group 3 — Dangerous tools",  "Named in the deny policy. Zuma should log DENY by explicit rule."),
+]
+
+def scenario_policy_demo(gw_url: str, api_key: str):
+    _header("Policy Demo — all 13 tools",
+            "Safe, then unlisted, then dangerous. Compare each call with Evaluation Logs.",
+            "PBAC")
+    print(yellow("  NOTE: in Monitor mode every call goes through, so destructive tools really run on the\n"
+                 "  dummy servers (e.g. delete_customer removes a record until the server resets).\n"))
+
+    results = []
+    n = 0
+    total = len(TOOLS)
+    for expected, title, blurb in POLICY_GROUPS:
+        print(f"\n  {bold(title)}")
+        print(f"  {dim(blurb)}")
+        for tool in [t for t in TOOLS if t.expected == expected]:
+            n += 1
+            res = fire(gw_url, api_key, f"Call {n}/{total} · {title}", tool.short)
+            if res is None:
+                status = "skipped"
+            else:
+                status = "OK" if _result_ok(res) else "ERROR"
+            results.append((tool, status))
+            pause(1.0)
+
+    # Summary table
+    print("\n  " + "─" * 78)
+    print(f"  {'Tool':<36}  {'Risk':<5} {'Zuma should log':<22} Script")
+    print("  " + "─" * 78)
+    for tool, status in results:
+        tier = TIER_COLOUR[tool.tier](f"{tool.tier:<5}")
+        exp = {"ALLOW": "ALLOW", "DENY-RULE": "DENY (rule)", "DENY-DEFAULT": "DENY (default)"}[tool.expected]
+        st = green(status) if status == "OK" else (yellow(status) if status == "skipped" else red(status))
+        print(f"  {tool.short:<36}  {tier} {exp:<22} {st}")
+    print("  " + "─" * 78)
+    print(dim("  Script 'OK' with Zuma 'DENY' = Monitor mode working: the call was let through but\n"
+              "  recorded as it would have been blocked. In Block mode those rows show ERROR instead."))
+    _footer("Policy demo complete. Open Runtime Authorization > Evaluation Logs and compare.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rogue scenarios
+# ─────────────────────────────────────────────────────────────────────────────
 
 def scenario_volumetric(gw_url: str, api_key: str, call_count: int = 30, interval: float = 0.5):
     _header("Scenario 1 — Volumetric Anomaly", f"{call_count} calls, {interval}s interval", "Volumetric")
     start = time.time()
     for i in range(1, call_count + 1):
-        fire(gw_url, api_key, f"Call {i}/{call_count}", f"{ITSM_PREFIX}get_ticket_status", {"ticket_id": random.choice(TICKET_IDS)}, quiet=(i > 1 and not _STEP_MODE))
-        if i == 1 and not _STEP_MODE: log.info(dim(f"  ({call_count - 1} more calls executing...)"))
+        fire(gw_url, api_key, f"Call {i}/{call_count}", "get_ticket_status",
+             {"ticket_id": random.choice(TICKET_IDS)}, quiet=(i > 1 and not _STEP_MODE))
+        if i == 1 and not _STEP_MODE:
+            log.info(dim(f"  ({call_count - 1} more calls executing...)"))
         pause(interval)
-    _footer(f"Volumetric completed in {time.time()-start:.1f}s")
+    _footer(f"Volumetric completed in {time.time() - start:.1f}s")
 
 def scenario_drift(gw_url: str, api_key: str):
     _header("Scenario 2 — Behaviour Drift", "ITSM-baseline agent pivoting into CRM", "Drift")
-    fire(gw_url, api_key, "Baseline", f"{ITSM_PREFIX}get_ticket_status", {"ticket_id": "TICK-101"})
+    fire(gw_url, api_key, "Baseline", "get_ticket_status", {"ticket_id": "TICK-101"})
     pause(1.0)
-    fire(gw_url, api_key, "Pivot start", f"{CRM_PREFIX}list_customers", {})
+    fire(gw_url, api_key, "Pivot start", "list_customers", {})
     pause(1.0)
-    fire(gw_url, api_key, "Enumeration", f"{CRM_PREFIX}get_customer_by_id", {"id": "CUST-104"})
+    fire(gw_url, api_key, "Enumeration", "get_customer_by_id", {"id": "CUST-104"})
     pause(1.0)
-    fire(gw_url, api_key, "Malicious Act", f"{CRM_PREFIX}update_credit_limit", {"id": "CUST-104", "newLimit": 999999, "reason": "VIP Override"})
+    fire(gw_url, api_key, "Malicious Act", "update_credit_limit",
+         {"id": "CUST-104", "newLimit": 999999, "reason": "VIP Override"})
     pause(1.0)
-    fire(gw_url, api_key, "Exfiltration", f"{CRM_PREFIX}export_customer_data", {})
+    fire(gw_url, api_key, "Exfiltration", "export_customer_data", {})
     _footer("Drift scenario executed.")
 
 def scenario_iara(gw_url: str, api_key: str):
     _header("Scenario 3 — IARA Intent Pattern", "Recon → Scope → Privilege Escalation", "IARA")
     for user in USER_IDS:
-        fire(gw_url, api_key, "Recon", f"{ITSM_PREFIX}check_user_permissions", {"user_id": user})
+        fire(gw_url, api_key, "Recon", "check_user_permissions", {"user_id": user})
         pause(1.0)
-    fire(gw_url, api_key, "Scope", f"{ITSM_PREFIX}search_tickets_by_customer", {"customer_id": "CUST-104"})
+    fire(gw_url, api_key, "Scope", "search_tickets_by_customer", {"customer_id": "CUST-104"})
     pause(1.0)
-    fire(gw_url, api_key, "Escalate", f"{ITSM_PREFIX}escalate_ticket_priority", {"ticket_id": "TICK-101", "new_priority": "Critical", "justification": "Emergency Access"})
+    fire(gw_url, api_key, "Escalate", "escalate_ticket_priority",
+         {"ticket_id": "TICK-101", "new_priority": "Critical", "justification": "Emergency Access"})
     pause(1.0)
-    fire(gw_url, api_key, "Payload 1", f"{ITSM_PREFIX}grant_admin_privilege", {"user_id": "usr_882", "role": "SuperAdmin"})
+    fire(gw_url, api_key, "Payload 1", "grant_admin_privilege", {"user_id": "usr_882", "role": "SuperAdmin"})
     pause(1.0)
-    fire(gw_url, api_key, "Payload 2", f"{ITSM_PREFIX}purge_audit_logs", {"retention_days": 0})
+    fire(gw_url, api_key, "Payload 2", "purge_audit_logs", {"retention_days": 0})
     _footer("IARA sequence executed.")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool invocation mode (menu)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_menu():
+    """Returns (ordered list of (number, label, action), rendered lines)."""
+    items = []   # (kind, text, payload)
+    n = 1
+    def add(label, action):
+        nonlocal n
+        items.append(("opt", n, label, action)); n += 1
+    def sec(text):
+        items.append(("sec", text))
+
+    add("Test Connection & List All Tools", "test")
+    add("Wake up backends (free-tier cold start)", "wake")
+    for system, title in (("ITSM", f"ITSM tools ({ITSM_PREFIX.rstrip('_')})"), ("CRM", f"CRM tools ({CRM_PREFIX.rstrip('_')})")):
+        sec(title)
+        for t in [x for x in TOOLS if x.system == system]:
+            add(t.short, ("tool", t))
+    sec("Policy demo")
+    add("Run Policy Demo: all 13 tools, grouped by expected outcome", "policy")
+    sec("Go Rogue: Automated Scenarios")
+    add("Run Scenario 1: Volumetric Anomaly", "s1")
+    add("Run Scenario 2: Behavior Drift", "s2")
+    add("Run Scenario 3: IARA Intent Pattern", "s3")
+    add("Run ALL Scenarios", "all")
+    add("Exit to Main Menu", "exit")
+    return items
+
 def run_tool_invocation_mode():
-    print("\n" + "="*62)
+    print("\n" + "=" * 62)
     print(bold(" TOOL INVOCATION MODE — Runtime Gateway Setup"))
-    print("="*62)
+    print("=" * 62)
 
     gw_def = os.environ.get("ZUMA_GATEWAY_URL", "https://identity-beta-gateway-dataplane.saviyntcloud.com/mcp/YOUR_GATEWAY_ID")
     gateway_url = input(f" Enter Gateway URL [{gw_def}]: ").strip() or gw_def
@@ -419,105 +924,116 @@ def run_tool_invocation_mode():
     else:
         api_key = getpass.getpass(" Enter Gateway API Key [hidden]: ").strip()
 
-    source_def = os.environ.get("ZUMA_AGENT_SOURCE_ID", "python-script-001")
-    agent_source_id = input(f" Enter Registered Agent Source ID [{source_def}]: ").strip() or source_def
+    source_def = (f"agent-registry:{_REGISTERED_AGENT_ID}" if _REGISTERED_AGENT_ID else os.environ.get("ZUMA_AGENT_SOURCE_ID", "python-script-001"))
+    agent_source_id = input(f" Enter Agent Source ID for the MCP handshake [{source_def}]: ").strip() or source_def
 
     if not api_key or "YOUR_GATEWAY_ID" in gateway_url:
         print(red("\n Error: Valid Gateway URL and Gateway API Key are required.\n"))
         return
 
-    # Execute MCP Handshake
     if not initialize_gateway_session(gateway_url, api_key, agent_source_id):
         return
 
-    # Present Tool Invocation Menu
+    # Cache tool schemas quietly so guessed arguments can be built from them
+    load_tool_schemas(gateway_url, api_key)
+
+    menu = _build_menu()
+    last = max(i[1] for i in menu if i[0] == "opt")
+    actions = {i[1]: i[3] for i in menu if i[0] == "opt"}
+
     while True:
-        print("\n" + "─"*62)
+        print("\n" + "─" * 62)
         print(bold(" TOOL INVOCATION MENU — Select Action"))
-        print("─"*62)
-        print("  1) Test Connection & List All Tools")
-        print(dim("  --- Standard Operations ---"))
-        print("  2) ITSM: Get Ticket Status")
-        print("  3) CRM:  List Customers")
-        print("  4) CRM:  Get Customer by ID")
-        print(dim("  --- High-Risk / Destructive Operations ---"))
-        print("  5) ITSM: Escalate Ticket Priority")
-        print("  6) CRM:  Update Credit Limit")
-        print("  7) ITSM: Purge Audit Logs")
-        print(dim("  --- Go Rogue: Automated Scenarios ---"))
-        print("  8) Run Scenario 1: Volumetric Anomaly")
-        print("  9) Run Scenario 2: Behavior Drift")
-        print(" 10) Run Scenario 3: IARA Intent Pattern")
-        print(" 11) Run ALL Scenarios")
-        print(" 12) Exit to Main Menu")
-        print("─"*62)
+        print("─" * 62)
+        for item in menu:
+            if item[0] == "sec":
+                print(dim(f"  --- {item[1]} ---"))
+            else:
+                _, num, label, action = item
+                if isinstance(action, tuple):
+                    t = action[1]
+                    tag = TIER_COLOUR[t.tier](f"[{t.tier}]")
+                    print(f" {num:>2}) {t.short:<28} {tag}")
+                else:
+                    print(f" {num:>2}) {label}")
+        print("─" * 62)
 
-        choice = input(" Select option [1-12]: ").strip()
+        choice = input(f" Select option [1-{last}]: ").strip()
+        if not choice.isdigit() or int(choice) not in actions:
+            print(red(f" Invalid choice. Select 1-{last}."))
+            continue
 
-        if choice == "1":
-            option_test_tools(gateway_url, api_key)
-        elif choice == "2":
-            run_single_tool(gateway_url, api_key, f"{ITSM_PREFIX}get_ticket_status", {"ticket_id": "TICK-101"})
-        elif choice == "3":
-            run_single_tool(gateway_url, api_key, f"{CRM_PREFIX}list_customers", {})
-        elif choice == "4":
-            run_single_tool(gateway_url, api_key, f"{CRM_PREFIX}get_customer_by_id", {"id": "CUST-104"})
-        elif choice == "5":
-            run_single_tool(gateway_url, api_key, f"{ITSM_PREFIX}escalate_ticket_priority", {"ticket_id": "TICK-101", "new_priority": "Critical", "justification": "VIP Request"})
-        elif choice == "6":
-            run_single_tool(gateway_url, api_key, f"{CRM_PREFIX}update_credit_limit", {"id": "CUST-104", "newLimit": 250000, "reason": "Contract expansion"})
-        elif choice == "7":
-            run_single_tool(gateway_url, api_key, f"{ITSM_PREFIX}purge_audit_logs", {"retention_days": 0})
-        elif choice == "8":
-            scenario_volumetric(gateway_url, api_key)
-        elif choice == "9":
-            scenario_drift(gateway_url, api_key)
-        elif choice == "10":
-            scenario_iara(gateway_url, api_key)
-        elif choice == "11":
-            if option_test_tools(gateway_url, api_key):
+        action = actions[int(choice)]
+        try:
+            if action == "test":
+                option_test_tools(gateway_url, api_key)
+            elif action == "wake":
+                wake_backends(gateway_url, api_key)
+            elif action == "policy":
+                scenario_policy_demo(gateway_url, api_key)
+            elif action == "s1":
                 scenario_volumetric(gateway_url, api_key)
+            elif action == "s2":
                 scenario_drift(gateway_url, api_key)
+            elif action == "s3":
                 scenario_iara(gateway_url, api_key)
-        elif choice == "12":
-            break
-        else:
-            print(red(" Invalid choice. Select 1-12."))
+            elif action == "all":
+                if option_test_tools(gateway_url, api_key):
+                    scenario_volumetric(gateway_url, api_key)
+                    scenario_drift(gateway_url, api_key)
+                    scenario_iara(gateway_url, api_key)
+            elif action == "exit":
+                break
+            elif isinstance(action, tuple):
+                run_single_tool(gateway_url, api_key, action[1])
+        except KeyboardInterrupt:
+            print(yellow("\n  Interrupted. Back to the menu.\n"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Top-Level Entry Point
+# Top-level entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global _STEP_MODE
-    parser = argparse.ArgumentParser(description="Zuma Rogue Agent Demo v9")
+    global _STEP_MODE, ITSM_PREFIX, CRM_PREFIX
+    parser = argparse.ArgumentParser(description="Zuma Rogue Agent Demo v10")
     parser.add_argument("--step", action="store_true", help="Enable presenter step mode")
+    parser.add_argument("--itsm-prefix", help=f"ITSM tool-name prefix (default {ITSM_PREFIX})")
+    parser.add_argument("--crm-prefix", help=f"CRM tool-name prefix (default {CRM_PREFIX})")
     args = parser.parse_args()
     _STEP_MODE = args.step
+    if args.itsm_prefix:
+        ITSM_PREFIX = args.itsm_prefix
+    if args.crm_prefix:
+        CRM_PREFIX = args.crm_prefix
 
-    while True:
-        print("\n" + "="*62)
-        print(bold(" ZUMA ROGUE AGENT SIMULATOR v9"))
-        print(" Saviynt Channel Partner Enablement · Tommy Roberts")
-        print("="*62)
-        print(" Choose execution workflow:")
-        print("  1) Register Agent Identity (Agent Registry API)")
-        print("  2) Invoke Tools & Run Scenarios (Access Gateway)")
-        print("  3) Exit")
-        print("="*62)
+    try:
+        while True:
+            print("\n" + "=" * 62)
+            print(bold(" ZUMA ROGUE AGENT SIMULATOR v10"))
+            print(" Saviynt Channel Partner Enablement · Tommy Roberts")
+            print("=" * 62)
+            print(f" Tool prefixes: {cyan(ITSM_PREFIX)}  {cyan(CRM_PREFIX)}" + ("   [STEP MODE]" if _STEP_MODE else ""))
+            print(" Choose execution workflow:")
+            print("  1) Register Agent Identity (Agent Registry API)")
+            print("  2) Invoke Tools & Run Scenarios (Access Gateway)")
+            print("  3) Exit")
+            print("=" * 62)
 
-        main_choice = input(" Select option [1-3]: ").strip()
+            main_choice = input(" Select option [1-3]: ").strip()
 
-        if main_choice == "1":
-            run_agent_registration()
-        elif main_choice == "2":
-            run_tool_invocation_mode()
-        elif main_choice == "3":
-            print("\n Exiting demo script. Goodbye!\n")
-            sys.exit(0)
-        else:
-            print(red(" Invalid choice. Please enter 1, 2, or 3."))
+            if main_choice == "1":
+                run_agent_registration()
+            elif main_choice == "2":
+                run_tool_invocation_mode()
+            elif main_choice == "3":
+                print("\n Exiting demo script. Goodbye!\n")
+                sys.exit(0)
+            else:
+                print(red(" Invalid choice. Please enter 1, 2, or 3."))
+    except (KeyboardInterrupt, EOFError):
+        print("\n\n Exiting demo script. Goodbye!\n")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
